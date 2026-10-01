@@ -1,0 +1,34 @@
+# Clips generados por las corridas (los .mp4, .jpg, manifest.json y log.txt
+# de cada corrida). Son artefactos pesados y se regeneran fácil, no van al repo.
+clips/
+clips_test/
+*_test/
+clips_*/
+
+# Videos y audios de prueba generados por tests/make_test_video.py
+test_video.mp4
+*.wav
+
+# Cache de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Modelos descargados de whisper / OCR / etc. (son gigabytes)
+models/
+.cache/
+
+# Archivos temporales del OCR (visual.py crea esta carpeta)
+streamclipper_frames_*/
+
+# Editores / SO
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

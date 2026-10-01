@@ -8,6 +8,7 @@ filtros de ffmpeg) y luego se mezcla con un video de color plano.
 Uso: python tests/make_test_video.py test_video.mp4
 """
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -45,13 +46,26 @@ def main():
     out_path = sys.argv[1] if len(sys.argv) > 1 else "test_video.mp4"
     audio = build_audio()
 
-    with tempfile.NamedTemporaryFile(suffix=".wav") as wav_file:
-        wavfile.write(wav_file.name, SAMPLE_RATE, audio)
+    # OJO: acá NO se puede usar tempfile.NamedTemporaryFile. En Windows ese
+    # objeto abre el archivo con un handle exclusivo (O_EXCL) y lo mantiene
+    # abierto mientras el `with` está activo, así que cualquier otro proceso
+    # —incluido el `open(..., 'wb')` que hace scipy.io.wavfile.write— recibe
+    # PermissionError al intentar abrir el mismo path. En Linux/macOS el mismo
+    # código funciona, por eso el bug no se había notado.
+    #
+    # En su lugar usamos mkstemp, que nos devuelve el path y un file descriptor
+    # crudo: cerramos ese descriptor a mano y recién ahí le pedimos a scipy que
+    # escriba, así el archivo queda libre para abrirse en modo escritura.
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+
+    try:
+        wavfile.write(wav_path, SAMPLE_RATE, audio)
 
         cmd = [
             "ffmpeg", "-y",
             "-f", "lavfi", "-i", f"color=c=gray:s=640x360:d={TOTAL_DURATION}",
-            "-i", wav_file.name,
+            "-i", wav_path,
             "-c:v", "libx264", "-preset", "ultrafast",
             "-c:a", "aac",
             "-shortest",
@@ -59,6 +73,12 @@ def main():
             out_path,
         ]
         subprocess.run(cmd, check=True)
+    finally:
+        # El .wav es un intermedio de alto tamaño que no le sirve a nadie.
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
 
     print(f"Video de prueba creado: {out_path}")
     print(f"Momentos hype esperados (segundos): {HYPE_MOMENTS}")
