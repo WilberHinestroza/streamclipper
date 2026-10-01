@@ -17,7 +17,13 @@ import sys
 import traceback
 
 from .audio import compute_energy_profile, extract_pcm
-from .clipper import extract_clip, generate_thumbnail, write_temp_srt
+from .clipper import (
+    extract_clip,
+    generate_thumbnail,
+    probe_dimensions,
+    subtitle_margin_v,
+    write_temp_srt,
+)
 from .scoring import apply_keyword_boost, compute_hype_score, find_candidates, merge_overlapping
 from .transcribe import (
     find_keyword_timestamps,
@@ -131,6 +137,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pre-roll", type=float, default=8.0, help="Segundos antes del pico a incluir")
     p.add_argument("--post-roll", type=float, default=18.0, help="Segundos después del pico a incluir")
     p.add_argument("--vertical", action="store_true", help="Exportar en formato vertical 9:16")
+    p.add_argument(
+        "--vertical-fit", choices=["blur", "crop"], default="blur",
+        help="Cómo se adapta el video 16:9 al lienzo vertical 9:16 (requiere --vertical). "
+             "'blur' (default) = el gameplay entra COMPLETO y una copia de fondo ampliada y "
+             "desenfocada llena el resto del 9:16 (nada de barras negras, nada de juego perdido). "
+             "'crop' = el recorte centrado de siempre, que en 16:9 se queda con solo un "
+             "tercio del ancho del juego.",
+    )
     p.add_argument(
         "--vertical-layout", choices=["crop", "cam-top"], default="crop",
         help="Diseño del formato vertical (requiere --vertical). 'crop' = recorte centrado normal "
@@ -389,6 +403,20 @@ def _run(args: argparse.Namespace, out_dir: str) -> int:
     print(f"[6/6] Exportando {total} clips a {out_dir}/ ...")
     emit_progress(stage="export_start", total=total)
 
+    # Los subtítulos quemados en el vertical con fondo desenfocado caerían,
+    # por defecto, sobre el fondo borroso de abajo (no sobre el gameplay). Para
+    # apoyarlos sobre el juego hay que subirlos, y cuánta distancia depende del
+    # aspecto real del video: en un 16:9 el gameplay ocupa ~1080x607 de los 1920
+    # de alto, así que el hueco de abajo es de ~650px, mientras que en un video
+    # ya casi vertical el hueco es de ~10px. Por eso se mide el video con
+    # ffprobe y se calcula en vez de usar un margen fijo.
+    subtitle_margin = None
+    if args.captions and args.vertical:
+        vw, vh = probe_dimensions(args.video)
+        if vw and vh:
+            subtitle_margin = subtitle_margin_v(vw, vh)
+            print(f"      Video {vw}x{vh}: subtítulos {subtitle_margin}px sobre el borde inferior")
+
     manifest = []
     for i, cand in enumerate(candidates, start=1):
         out_path = os.path.join(out_dir, f"clip_{i:02d}_score{cand.score:.2f}.mp4")
@@ -417,6 +445,8 @@ def _run(args: argparse.Namespace, out_dir: str) -> int:
             srt_path=srt_path,
             reencode=not args.fast,
             normalize_audio=not args.no_normalize,
+            vertical_fit=args.vertical_fit,
+            subtitle_margin=subtitle_margin,
         )
 
         thumb_path = None

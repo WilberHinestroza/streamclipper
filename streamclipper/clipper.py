@@ -26,6 +26,152 @@ def escape_filter_path(path: str) -> str:
     return normalized.replace(":", r"\:")
 
 
+def _subtitle_filter(srt_path: str, margin: int | None = None) -> str:
+    """Filtro de subtítulos quemados, opcionalmente subido.
+
+    Sin `margin` se usa la posición por defecto (abajo del todo). Con `margin`
+    se sube esa cantidad de píxeles desde el borde inferior, para que en el
+    vertical con fondo desenfocado caigan SOBRE el gameplay y no sobre el
+    fondo borroso. El valor lo calcula `subtitle_margin_v` según el aspecto
+    real del video de origen.
+    """
+    if not margin:
+        return f"subtitles='{escape_filter_path(srt_path)}'"
+    return (
+        f"subtitles='{escape_filter_path(srt_path)}'"
+        f":force_style='Alignment=2,MarginV={int(margin)}'"
+    )
+
+
+def _fit_over_blur_chain(
+    w: int,
+    h: int,
+    blur_sigma: int = 12,
+    cam_region: tuple[float, float, float, float] | None = None,
+    out_label: str = "vout",
+) -> str:
+    """Construye el filtro que mete el frame COMPLETO dentro de un lienzo
+    `w` x `h` (9:16) sin recortar el gameplay, con una copia de fondo
+    ampliada y desenfocada ocupando el espacio sobrante.
+
+    Es la diferencia entre "se ve mal porque recorta" y "se ve entero":
+    antes el filtro hacía `crop` centrado, que en un gameplay 16:9 se
+    quedaba con solo el ~32% del ancho del juego. Acá la capa de juego usa
+    `force_original_aspect_ratio=decrease` (cabe entero) y la de fondo usa
+    `increase` (cubre todo) + desenfoque.
+
+    El fondo NO usa un `gblur` fuerte y caro: primero se reduce a 1/4 de
+    resolución y después se vuelve a escalar a `w`x`h`. Ese reescalado hacia
+    arriba es lo que produce el desenfoque, y sale mucho más barato que
+   difuminar un frame de 1080x1920 píxel a píxel.
+
+    `cam_region` es opcional: si viene, la capa de juego es un recorte de esa
+    región (usado por el layout 'cam-top'), y el fondo se arma con el frame
+    entero para que el relleno quede lleno.
+    """
+    # El fondo se reduce a 1/4 antes de difuminar: el upscale posterior hace
+    # el resto del trabajo y el coste de gblur cae ~16x.
+    bw, bh = max(2, w // 4), max(2, h // 4)
+    parts = [
+        f"[0:v]split=2[bgsrc][fgsrc]",
+        f"[bgsrc]scale={bw}:{bh}:force_original_aspect_ratio=increase,"
+        f"crop={bw}:{bh},scale={w}:{h},setsar=1,gblur=sigma={blur_sigma}[bg]",
+    ]
+    if cam_region:
+        rx, ry, rw, rh = cam_region
+        parts.append(
+            f"[fgsrc]crop={rw:.4f}*iw:{rh:.4f}*ih:{rx:.4f}*iw:{ry:.4f}*ih,"
+            f"scale={w}:{h}:force_original_aspect_ratio=decrease,setsar=1[fg]"
+        )
+    else:
+        parts.append(
+            f"[fgsrc]scale={w}:{h}:force_original_aspect_ratio=decrease,setsar=1[fg]"
+        )
+    parts.append(f"[bg][fg]overlay=(W-w)/2:(H-h)/2[{out_label}]")
+    return ";".join(parts)
+
+
+def crop_center_chain(w: int, h: int, out_label: str = "vout") -> str:
+    """El layout vertical ORIGINAL: recorte centrado al 9:16.
+
+    Se conserva por compatibilidad (--vertical-fit crop), pero crops el
+    gameplay sin piedad: en 16:9 sobre un lienzo 9:16 se queda con el centro
+    y se pierde la mayor parte de la pantalla del juego. Para eso está
+    `fit_over_blur_chain`, que es el default ahora.
+    """
+    return (
+        f"[0:v]crop='min(iw,ih*{w}/{h})':'min(ih,iw*{h}/{w})',"
+        f"scale={w}:{h},setsar=1[{out_label}]"
+    )
+
+
+def subtitle_margin_v(
+    video_width: int,
+    video_height: int,
+    target_w: int = 1080,
+    target_h: int = 1920,
+    pad_above_game_edge: int = 170,
+) -> int:
+    """Calcula el `MarginV` para los subtítulos del vertical, de modo que caigan
+    SOBRE el gameplay y no sobre el fondo desenfocado de abajo.
+
+    El gameplay entra completo con `decrease`, así que su alto real en el
+    lienzo es `video_height * min(target_w/video_width, target_h/video_height)`
+    y queda centrado verticalmente: el borde inferior del gameplay queda en
+    `target_h - (target_h - game_h) / 2`, y `gap` es el hueco de fondo que hay
+    entre ese borde y el final del lienzo.
+
+    Para que el texto no caiga en ese hueco hay que moverlo hacia arriba unos
+    `gap + pad` píxeles. Y acá está el detalle contraintuitivo: `MarginV`
+    (que en ASS es la distancia al borde INFERIOR) NO mueve el texto en esa
+    dirección — medido empíricamente sobre un lienzo de 1920, CADA unidad de
+    MarginV sube el texto 6.4px. Por eso el desplazamiento deseado se divide
+    por ese factor.
+    """
+    if video_width <= 0 or video_height <= 0:
+        return 0
+    scale = min(target_w / video_width, target_h / video_height)
+    game_h = video_height * scale
+    game_bottom = target_h - (target_h - game_h) / 2.0
+
+    # Un video ya vertical tiene el juego pegado al borde inferior y no hay
+    # fondo que tapar: no hace falta mover nada (y moverlo sacaría el texto
+    # de cuadro).
+    gap = target_h - game_bottom
+    if gap < 10:
+        return 0
+
+    wanted = gap + pad_above_game_edge
+    # ASS_SSRT_SCALE: factor con el que libass convierte MarginV a píxeles reales
+    # (medido en ffmpeg 9 sobre un lienzo de 1920: 6.4 px por unidad).
+    scale_factor = target_h / 300.0
+    return max(0, int(round(wanted / scale_factor)))
+
+
+def probe_dimensions(video_path: str) -> tuple[int, int]:
+    """Lee el ancho y alto del video con ffprobe, para poder calcular cosas
+    que dependen del aspecto (ej. la posición de los subtítulos en vertical).
+
+    Si ffprobe falla o no devuelve dimensiones usable, devuelve (0, 0) en vez
+    de cortar la corrida: los callers tratan eso como "no sé el aspecto" y
+    usan los defaults.
+    """
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0:s=x", video_path,
+    ]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            return (0, 0)
+        out = proc.stdout.decode().strip().splitlines()[0]
+        parts = out.split("x")
+        return (int(parts[0]), int(parts[1]))
+    except Exception:
+        return (0, 0)
+
+
 def extract_clip(
     video_path: str,
     candidate: Candidate,
@@ -37,6 +183,8 @@ def extract_clip(
     srt_path: str | None = None,
     reencode: bool = True,
     normalize_audio: bool = True,
+    vertical_fit: str = "blur",
+    subtitle_margin: int | None = None,
 ) -> None:
     """Corta un clip [candidate.start, candidate.end] del video original.
 
@@ -86,43 +234,50 @@ def extract_clip(
 
         if use_cam_layout:
             rx, ry, rw, rh = cam_region
-            # Recorta la región de la cámara (en fracción del frame, así no
-            # hace falta conocer el tamaño real del video de antemano) y la
-            # escala/recorta para llenar la mitad superior o inferior del
-            # lienzo vertical 1080x1920 sin deformarla.
+            # La cámara va a media pantalla y el gameplay a la otra, cada uno
+            # en su propio lienzo 1080x960. Para el gameplay usamos la misma
+            # lógica "fit sobre fondo desenfocado" que en el vertical normal,
+            # pero contra un lienzo 1080x960: así el gameplay entra COMPLETO
+            # en su mitad, en vez de recortarse al centro (que en 16:9
+            # empujaba la mitad del juego fuera de cuadro).
             cam_chain = (
                 f"[0:v]crop={rw:.4f}*iw:{rh:.4f}*ih:{rx:.4f}*iw:{ry:.4f}*ih,"
                 "scale=1080:960:force_original_aspect_ratio=increase,"
                 "crop=1080:960,setsar=1[cam]"
             )
-            # El gameplay se recorta y escala igual que el modo vertical
-            # normal (recorte centrado sobre el frame completo) para llenar
-            # la otra mitad. No se "recorta" la cámara fuera del gameplay a
-            # propósito: es más simple/robusto y de todos modos la cámara
-            # suele ser una ventanita chica en una esquina.
-            game_chain = (
-                "[0:v]scale=1080:960:force_original_aspect_ratio=increase,"
-                "crop=1080:960,setsar=1[game]"
+            game_chain = _fit_over_blur_chain(
+                1080, 960, out_label="game"
             )
             top_label, bottom_label = ("[cam]", "[game]") if cam_position == "top" else ("[game]", "[cam]")
             final_label = "[vout]"
             stack_chain = f"{top_label}{bottom_label}vstack=inputs=2[vstacked]"
             if srt_path:
-                stack_chain += f";[vstacked]subtitles='{escape_filter_path(srt_path)}'{final_label}"
+                stack_chain += f";[vstacked]{_subtitle_filter(srt_path, subtitle_margin)}[vout]"
             else:
                 final_label = "[vstacked]"
 
             filter_complex = ";".join([cam_chain, game_chain, stack_chain])
             cmd += ["-filter_complex", filter_complex, "-map", final_label, "-map", "0:a?"]
+        elif vertical:
+            # Vertical 9:16. El default es 'blur': el gameplay entra entero
+            # con un fondo desenfocado que llena el resto del 9:16 (sin
+            # perder nada de la pantalla del juego, que era el defecto del
+            # crop centrado). 'crop' conserva el recorte al centro de antes.
+            if vertical_fit == "crop":
+                video_chain = crop_center_chain(1080, 1920, out_label="vout")
+            else:
+                video_chain = _fit_over_blur_chain(1080, 1920, out_label="vout")
+            if srt_path:
+                sub = _subtitle_filter(srt_path, subtitle_margin)
+                video_chain = f"{video_chain};[vout]{sub}[vsub]"
+                final_label = "[vsub]"
+            else:
+                final_label = "[vout]"
+            cmd += ["-filter_complex", video_chain, "-map", final_label, "-map", "0:a?"]
         else:
             filters = []
-            if vertical:
-                # Recorta al centro y escala a 1080x1920 (formato TikTok/Shorts/Reels).
-                filters.append(
-                    "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=1080:1920"
-                )
             if srt_path:
-                filters.append(f"subtitles='{escape_filter_path(srt_path)}'")
+                filters.append(_subtitle_filter(srt_path, subtitle_margin))
             if filters:
                 cmd += ["-vf", ",".join(filters)]
 

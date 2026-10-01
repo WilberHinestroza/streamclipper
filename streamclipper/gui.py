@@ -243,6 +243,15 @@ class StreamClipperGUI(tk.Tk):
         ).grid(row=row, column=0, columnspan=2, sticky="w", **pad)
         row += 1
 
+        self.vertical_blur_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frame,
+            text="   Fondo desenfocado: el gameplay entra COMPLETO en el 9:16 "
+                 "(sin recortar). Desmarcálo si preferís el recorte al centro.",
+            variable=self.vertical_blur_var,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", **pad)
+        row += 1
+
         ttk.Label(frame, text="   Diseño vertical:").grid(row=row, column=0, sticky="w", **pad)
         self.vertical_layout_var = tk.StringVar(value="Recorte centrado")
         self.vertical_layout_combo = ttk.Combobox(
@@ -587,6 +596,7 @@ class StreamClipperGUI(tk.Tk):
         ]
         if self.vertical_var.get():
             args.append("--vertical")
+            args += ["--vertical-fit", "blur" if self.vertical_blur_var.get() else "crop"]
             if self.vertical_layout_var.get() == "Cámara arriba + gameplay abajo":
                 args += ["--vertical-layout", "cam-top"]
                 if self.cam_region_var.get().strip():

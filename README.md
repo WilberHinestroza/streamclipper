@@ -99,7 +99,8 @@ Esto genera hasta 8 clips en la carpeta `clips/`, ordenados por score
 | `--fast` | Corte rápido sin recodificar. Más veloz pero el clip puede arrancar en el keyframe más cercano (a veces se ve entrecortado al inicio). Por defecto siempre recodifica para evitar ese problema |
 | `--min-gap S` | Segundos mínimos entre dos clips distintos (default 25) |
 | `--pre-roll S` / `--post-roll S` | Cuánto contexto incluir antes/después del pico (default 8s / 18s) |
-| `--vertical` | Exporta en 1080x1920 (recorte centrado) para TikTok/Shorts/Reels |
+| `--vertical` | Exporta en 1080x1920 para TikTok/Shorts/Reels |
+| `--vertical-fit blur\|crop` | Cómo se adapta el video 16:9 al lienzo 9:16. `blur` (default) = el gameplay entra **completo**, con una copia de fondo ampliada y desenfocada llenando el resto (sin barras negras, sin perder juego). `crop` = el recorte centrado de siempre |
 | `--transcribe` | Activa transcripción con whisper (más lento, necesita `faster-whisper`) |
 | `--captions` | Quema subtítulos en el clip (requiere `--transcribe`) |
 | `--whisper-model` | tiny/base/small/medium/large-v3 (default base; más grande = más preciso y más lento) |
@@ -258,12 +259,59 @@ sirven para tu forma de hablar, puedes agregarlas de vuelta con
 `--hype-keywords` (ver tabla de opciones arriba) — ese campo también está
 disponible en la interfaz gráfica, en la sección de transcripción.
 
+## Vertical 9:16 sin perder gameplay (`--vertical-fit blur`)
+
+Antes, activar el vertical (checkbox "Formato vertical 9:16" en la GUI, o
+`--vertical` en la terminal) aplicaba un **recorte centrado** al centro del
+frame. Para pasar de 16:9 a 9:16 eso recorta a una columna angosta: en un
+gameplay 1920x1080 el clip final conserva el 100% del alto pero apenas el
+**32% del ancho** del juego — se perdían los bordes izquierdo y derecho, que
+en la mayoría de los juegos es justo donde está el HUD, el inventario y los
+jugadores enemigos. Además el recorte se upscaleaba a 1080 de ancho, así que
+además de perder contenido se veía borroso.
+
+Ahora el default es `blur`: el gameplay entra **completo** (escalado a caber
+con `force_original_aspect_ratio=decrease`) y el espacio sobrante del 9:16 se
+llena con una copia del mismo frame ampliada y **desenfocada**, en lugar de
+recortarse o dejar barras negras. Es el mismo recurso que usan las apps
+verticales para adaptar contenido horizontal.
+
+Detalles de la implementación:
+
+- **El fondo sale barato.** En vez de aplicar un desenfoque fuerte a un frame
+  de 1080x1920 (que es de lo más caro en CPU), primero se reduce a 1/4 de
+  resolución y después se vuelve a escalar al tamaño final: ese reescalado
+  *es* el desenfoque, y sale ~16x más barato.
+- **Los subtítulos se reposicionan solos.** Con el fondo desenfocado, los
+  subtítulos quemados por defecto caerían sobre el fondo borroso de abajo, no
+  sobre el juego. El programa lee las dimensiones del video con `ffprobe` y
+  calcula el `MarginV` necesario para apoyarlos sobre el gameplay. No se usa
+  un margen fijo porque el hueco depende del aspecto de origen: en un 16:9 es
+  de ~650px y en un video ya vertical es de ~0 (en ese caso no se mueve nada,
+  para no sacar el texto de cuadro).
+- Si el video de origen ya es 9:16, el juego llena el lienzo entero y el
+  fondo desenfocado no llega a verse: el resultado es un recorte limpio.
+
+Para volver al comportamiento anterior:
+
+```bash
+python -m streamclipper.cli mi_vod.mp4 --vertical --vertical-fit crop
+```
+
+En la GUI es la casilla "Fondo desenfocado: el gameplay entra COMPLETO en el
+9:16", dentro de la sección de formato vertical.
+
 ## Vertical con cámara arriba y gameplay abajo (`--vertical-layout cam-top`)
 
 Si grabas horizontal con tu cámara (facecam) como una ventanita superpuesta,
 esta opción arma el vertical 9:16 con tu cámara ocupando una mitad
 (1080x960) y el gameplay completo ocupando la otra mitad, en vez del
 recorte centrado normal que puede dejar tu cara fuera de cuadro.
+
+La mitad del gameplay usa el mismo tratamiento de "entra completo sobre fondo
+desenfocado" que el vertical normal, pero contra un lienzo de 1080x960: el
+juego se ve entero en su mitad, en vez de recortarse al centro (que dentro de
+una tan baja también empujaba parte del juego fuera de cuadro).
 
 ```bash
 # Detecta tu cámara sola (necesita opencv-python-headless instalado):
