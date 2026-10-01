@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import traceback
+import warnings
 
 from .audio import compute_energy_profile, extract_pcm
 from .clipper import (
@@ -272,7 +273,11 @@ def _run(args: argparse.Namespace, out_dir: str) -> int:
     if args.transcribe:
         print(f"[3/6] Transcribiendo con whisper ({args.whisper_model}) — esto puede tardar ...")
         try:
-            transcript_segments = transcribe(args.video, model_size=args.whisper_model, language=args.language)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                transcript_segments = transcribe(args.video, model_size=args.whisper_model, language=args.language)
+            for w in caught:
+                print(f"      Aviso: {w.message}")
             custom_hype_keywords = [k.strip() for k in args.hype_keywords.split(",") if k.strip()] or None
             keyword_hits = find_keyword_timestamps(transcript_segments, keywords=custom_hype_keywords)
             print(f"      {len(transcript_segments)} segmentos, {len(keyword_hits)} con keywords de hype")

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+import warnings
 from dataclasses import dataclass
 
 # Palabras/frases en español e inglés que suelen indicar un momento de hype
@@ -39,13 +40,9 @@ class TranscriptSegment:
     text: str
 
 
-def transcribe(video_path: str, model_size: str = "base", language: str | None = None):
-    """Transcribe el audio del video. Requiere `pip install faster-whisper`.
-
-    Devuelve una lista de TranscriptSegment. Lanza ImportError con un mensaje
-    claro si faster-whisper no está instalado, para que el CLI pueda avisar
-    al usuario y seguir sin transcripción en vez de reventar.
-    """
+def _load_whisper_model(model_size: str, device: str, compute_type: str):
+    """Import perezoso de faster-whisper (para que el resto del programa
+    funcione aunque no esté instalado) + construcción del modelo."""
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
@@ -54,9 +51,54 @@ def transcribe(video_path: str, model_size: str = "base", language: str | None =
             "`pip install faster-whisper` para usar subtítulos y detección "
             "de keywords, o usa --no-transcribe para saltarte este paso."
         ) from exc
+    return WhisperModel(model_size, device=device, compute_type=compute_type)
 
-    model = WhisperModel(model_size, device="auto", compute_type="auto")
+
+def _transcribe_with(model, video_path: str, language: str | None) -> list:
     segments, _info = model.transcribe(video_path, language=language, vad_filter=True)
+    return list(segments)
+
+
+def transcribe(video_path: str, model_size: str = "base", language: str | None = None):
+    """Transcribe el audio del video, con reintento en CPU si falla la GPU.
+
+    `device="auto"` hace que faster-whisper detecte una GPU NVIDIA y la use,
+    pero eso no siempre funciona: si tenés la GPU instalada pero las librerías
+    de CUDA de ctranslate2 no están (muy común — alcanza con tener el driver
+    instalado, no las runtime libs), la transcripción explota con
+    `Library cublas64_12.dll is not found`.
+
+    OJO con el detalle: ese error NO aparece al cargar el modelo (eso sí
+    funciona, porque solo reserva memoria), sino recién al transcribir, cuando
+    ctranslate2 llama a cuBLAS para la primera vez. Por eso el reintento tiene
+    que envolver la transcripción, no solo la carga.
+
+    La CPU SIEMPRE funciona, solo que más lento, así que reintentamos ahí antes
+    de dejar al usuario sin subtítulos. Si hubo que caer a CPU se avisa con
+    `warnings.warn` para que el CLI lo muestre en vez de perderlo en silencio.
+
+    Devuelve una lista de TranscriptSegment. Lanza ImportError con un mensaje
+    claro si faster-whisper no está instalado, para que el CLI pueda avisar
+    al usuario y seguir sin transcripción en vez de reventar.
+    """
+    try:
+        model = _load_whisper_model(model_size, device="auto", compute_type="auto")
+        segments = _transcribe_with(model, video_path, language)
+    except Exception as exc:  # noqa: BLE001
+        # No filtramos por tipo de excepción a propósito: si falla la GPU con
+        # cualquier cosa (dll faltante, driver incompatible, out of memory),
+        # en CPU casi siempre funciona. Solo propagamos el error si el
+        # reintento en CPU también falla, y ese error es el que vale la pena
+        # mostrar.
+        warnings.warn(
+            f"falló la transcripción en GPU ({type(exc).__name__}: "
+            f"{str(exc).strip().splitlines()[0] if str(exc).strip() else 'sin detalle'}), "
+            f"se reintenta en CPU (más lento)",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        model = _load_whisper_model(model_size, device="cpu", compute_type="int8")
+        segments = _transcribe_with(model, video_path, language)
 
     return [
         TranscriptSegment(start=seg.start, end=seg.end, text=seg.text.strip())
