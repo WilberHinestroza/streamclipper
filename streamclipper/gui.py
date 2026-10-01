@@ -53,8 +53,15 @@ class StreamClipperGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("StreamClipper — clips automáticos de tus VODs")
-        self.geometry("720x640")
-        self.minsize(680, 600)
+
+        # La altura inicial se calcula a partir del alto real de la pantalla
+        # en vez de usar un valor fijo (640, que era lo que recortaba el
+        # formulario en cualquier pantalla de notebook). Se deja un margen
+        # para la barra de tareas y el título de la ventana.
+        screen_h = self.winfo_screenheight()
+        initial_h = max(600, min(760, screen_h - 120))
+        self.geometry(f"720x{initial_h}")
+        self.minsize(680, 520)
 
         self.log_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.process: subprocess.Popen | None = None
@@ -68,9 +75,60 @@ class StreamClipperGUI(tk.Tk):
     # ------------------------------------------------------------------ UI
 
     def _build_form(self):
+        """Arma el formulario dentro de un área con scroll vertical.
+
+        El formulario tiene ~804px de contenido (más de lo que entra en la
+        altura por defecto de la ventana), así que va dentro de un Canvas con
+        scrollbar. Sin esto, Tkinter recortaba el frame a la altura disponible
+        y el botón 'Generar clips' quedaba FUERA de la ventana, sin forma de
+        alcanzarlo con el mouse.
+
+        El scroll se activa con la rueda del mouse, con la scrollbar, y con
+        RePág/AvPág cuando el área tiene el foco. El scrollbar además se
+        oculta solo cuando todo el contenido entra en la ventana.
+        """
         pad = {"padx": 8, "pady": 4}
-        frame = ttk.Frame(self)
-        frame.pack(fill="x", padx=10, pady=10)
+
+        scroll_frame = ttk.Frame(self)
+        scroll_frame.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+
+        # El Canvas necesita el mismo fondo que los frames ttk alrededor, o
+        # se ve una franja de otro color a los costados del contenido.
+        frame_bg = ttk.Style().lookup("TFrame", "background") or self.cget("background")
+
+        self.form_canvas = tk.Canvas(
+            scroll_frame,
+            highlightthickness=0,
+            bd=0,
+            background=frame_bg,
+        )
+        self.form_scrollbar = ttk.Scrollbar(
+            scroll_frame, orient="vertical", command=self.form_canvas.yview
+        )
+        self.form_canvas.configure(yscrollcommand=self._on_form_scroll)
+
+        self.form_scrollbar.pack(side="right", fill="y")
+        self.form_canvas.pack(side="left", fill="both", expand=True)
+
+        frame = ttk.Frame(self.form_canvas)
+        self._form_window = self.form_canvas.create_window((0, 0), window=frame, anchor="nw")
+
+        # Cuando el contenido crece/achica -> actualizar el rango scrolleable
+        # y decidir si la scrollbar hace falta.
+        frame.bind("<Configure>", self._on_form_configure)
+        # Cuando el Canvas cambia de tamaño -> estirar el frame interno para
+        # que ocupe todo el ancho disponible (si no, los entries se quedan
+        # con el ancho fijo en caracteres y sobra espacio en el medio).
+        self.form_canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # Rueda del mouse: Tkinter no la manda al Canvas por defecto, así que
+        # se registra UNA sola vez a nivel de la app y el handler decide por
+        # sí mismo si el puntero está sobre el formulario (si no, que la rueda
+        # siga funcionando normal en el log de texto de abajo).
+        self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.form_canvas.bind("<FocusIn>", lambda e: self.form_canvas.focus_set())
+        self.form_canvas.bind("<Prior>", lambda e: self.form_canvas.yview_scroll(-3, "units"))
+        self.form_canvas.bind("<Next>", lambda e: self.form_canvas.yview_scroll(3, "units"))
 
         row = 0
 
@@ -330,6 +388,56 @@ class StreamClipperGUI(tk.Tk):
         )
         self.open_folder_button.pack(side="left", padx=8)
 
+    # ---------------------------------------------------------- scroll del form
+
+    def _on_form_configure(self, _event=None):
+        """El frame interno cambió de tamaño: actualizar el rango scrolleable
+        y ocultar/mostrar la scrollbar según haga falta o no."""
+        self.form_canvas.configure(scrollregion=self.form_canvas.bbox("all"))
+        needs_scroll = self.form_canvas.bbox("all")[3] > self.form_canvas.winfo_height()
+        if needs_scroll and not self.form_scrollbar.winfo_ismapped():
+            self.form_scrollbar.pack(side="right", fill="y", before=self.form_canvas)
+        elif not needs_scroll and self.form_scrollbar.winfo_ismapped():
+            self.form_scrollbar.pack_forget()
+            # Si dejamos de scrollear, volver arriba: si no, el contenido
+            # queda medio desplazado y no se ve de dónde se salió.
+            self.form_canvas.yview_moveto(0)
+
+    def _on_canvas_configure(self, event):
+        """El Canvas cambió de ancho: estirar el frame interno para que los
+        widgets usen todo el espacio horizontal disponible."""
+        self.form_canvas.itemconfigure(self._form_window, width=event.width)
+
+    def _on_form_scroll(self, first, last):
+        self.form_scrollbar.set(first, last)
+
+    def _on_mousewheel(self, event):
+        """Rueda del mouse. Solo scrollea el formulario si el puntero está
+        encima; si está en el log de texto, deja que Tkinter haga lo suyo.
+
+        Windows manda el delta en múltiplos de 120 (un notch); en Linux/GTK
+        suele mandar ±1 por notch, así que se cubre ese caso también.
+        """
+        if not self.form_scrollbar.winfo_ismapped():
+            return
+
+        # ¿El puntero está sobre el Canvas del formulario?
+        widget = self.winfo_containing(event.x_root, event.y_root)
+        inside = False
+        while widget is not None:
+            if widget is self.form_canvas:
+                inside = True
+                break
+            widget = getattr(widget, "master", None)
+        if not inside:
+            return
+
+        if abs(event.delta) >= 120:
+            step = -int(event.delta / 120)
+        else:
+            step = -1 if event.delta > 0 else 1
+        self.form_canvas.yview_scroll(step, "units")
+
     def _build_progress(self):
         progress_frame = ttk.Frame(self)
         progress_frame.pack(fill="x", padx=10, pady=(0, 6))
@@ -342,9 +450,13 @@ class StreamClipperGUI(tk.Tk):
 
     def _build_log(self):
         log_frame = ttk.LabelFrame(self, text="Progreso")
-        log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        # Sin expand=True: el formulario es el contenido principal y es lo que
+        # necesita el espacio extra. El log se queda en su alto natural y se
+        # puede scrollear por dentro si hace falta.
+        log_frame.pack(fill="both", padx=10, pady=(0, 10))
+        self.log_frame = log_frame
 
-        self.log_text = tk.Text(log_frame, height=15, wrap="word", state="disabled")
+        self.log_text = tk.Text(log_frame, height=8, wrap="word", state="disabled")
         self.log_text.pack(side="left", fill="both", expand=True)
 
         scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
