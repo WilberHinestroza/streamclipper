@@ -36,16 +36,26 @@ GAME_PRESETS = {
     "Personalizado": None,
     "Minecraft / Just Chatting (reacciones habladas)": {
         "pre_roll": 10, "post_roll": 20, "min_gap": 30, "min_score": 0.5,
+        "kw_pre": 18, "kw_post": 12,
         "visual_keywords": "you died,has muerto,murió,you were slain,cayó desde una gran altura",
     },
     "Valorant / shooters (acción rápida)": {
         "pre_roll": 6, "post_roll": 12, "min_gap": 15, "min_score": 0.55,
+        "kw_pre": 12, "kw_post": 8,
         "visual_keywords": "you died,eliminated,derrota,has muerto,defeat,victory,victoria",
     },
     "FIFA / deportes (jugadas cortas)": {
         "pre_roll": 5, "post_roll": 15, "min_gap": 20, "min_score": 0.5,
+        "kw_pre": 10, "kw_post": 8,
         "visual_keywords": "goal,gol,red card,tarjeta roja",
     },
+}
+
+# Desplegable "Tipo de stream" -> valor del flag --stream-kind de la CLI.
+STREAM_KINDS = {
+    "Auto (detectar)": "auto",
+    "Gameplay": "gameplay",
+    "Just Chatting": "justchatting",
 }
 
 
@@ -230,6 +240,26 @@ class StreamClipperGUI(tk.Tk):
         )
         row += 1
 
+        ttk.Label(frame, text="Contexto antes / después de una palabra clave (s):").grid(
+            row=row, column=0, sticky="w", **pad
+        )
+        kw_frame = ttk.Frame(frame)
+        kw_frame.grid(row=row, column=1, sticky="w", **pad)
+        # Defaults distintos del pico normal a propósito: palabras como
+        # "ace"/"win"/"derrota" se dicen DESPUÉS de la jugada, así que lo que
+        # hay que mostrar está antes de la palabra (más contexto antes que
+        # después). Solo aplica con transcripción activada.
+        self.kw_pre_roll_var = tk.IntVar(value=15)
+        self.kw_post_roll_var = tk.IntVar(value=10)
+        ttk.Spinbox(kw_frame, from_=0, to=120, textvariable=self.kw_pre_roll_var, width=6).pack(
+            side="left"
+        )
+        ttk.Label(kw_frame, text=" / ").pack(side="left")
+        ttk.Spinbox(kw_frame, from_=0, to=120, textvariable=self.kw_post_roll_var, width=6).pack(
+            side="left"
+        )
+        row += 1
+
         ttk.Separator(frame, orient="horizontal").grid(
             row=row, column=0, columnspan=3, sticky="ew", pady=8
         )
@@ -345,6 +375,31 @@ class StreamClipperGUI(tk.Tk):
             frame,
             text="Separadas por coma. Vacío = usar la lista por defecto (español/inglés).\n"
                  "Refuerza el score cuando esas palabras aparecen en lo que dices/dicen.",
+            foreground="gray", justify="left",
+        ).grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
+        row += 1
+
+        ttk.Label(frame, text="Tipo de stream:").grid(row=row, column=0, sticky="w", **pad)
+        self.stream_kind_var = tk.StringVar(value="Auto (detectar)")
+        ttk.Combobox(
+            frame, textvariable=self.stream_kind_var, values=list(STREAM_KINDS.keys()),
+            state="readonly", width=25,
+        ).grid(row=row, column=1, sticky="w", **pad)
+        row += 1
+
+        self.chat_filter_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frame,
+            text="Evitar clips donde el grito es peleando/charlando con el chat (no penaliza en Just Chatting)",
+            variable=self.chat_filter_var,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", **pad)
+        row += 1
+
+        ttk.Label(
+            frame,
+            text="El tipo de stream se infiere de la transcripción (usá 'Just Chatting' para forzarlo). "
+                 "El filtro\ncompara el transcript de cada clip: si es solo charla con el chat y nada de "
+                 "juego, baja su score.",
             foreground="gray", justify="left",
         ).grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
         row += 1
@@ -482,6 +537,10 @@ class StreamClipperGUI(tk.Tk):
         self.post_roll_var.set(values["post_roll"])
         self.min_gap_var.set(values["min_gap"])
         self.min_score_var.set(values["min_score"])
+        if "kw_pre" in values:
+            self.kw_pre_roll_var.set(values["kw_pre"])
+        if "kw_post" in values:
+            self.kw_post_roll_var.set(values["kw_post"])
         if "visual_keywords" in values:
             self.visual_keywords_var.set(values["visual_keywords"])
 
@@ -593,7 +652,12 @@ class StreamClipperGUI(tk.Tk):
             "--min-gap", str(self.min_gap_var.get()),
             "--pre-roll", str(self.pre_roll_var.get()),
             "--post-roll", str(self.post_roll_var.get()),
+            "--keyword-pre-roll", str(self.kw_pre_roll_var.get()),
+            "--keyword-post-roll", str(self.kw_post_roll_var.get()),
+            "--stream-kind", STREAM_KINDS.get(self.stream_kind_var.get(), "auto"),
         ]
+        if not self.chat_filter_var.get():
+            args += ["--chat-penalty", "0"]
         if self.vertical_var.get():
             args.append("--vertical")
             args += ["--vertical-fit", "blur" if self.vertical_blur_var.get() else "crop"]

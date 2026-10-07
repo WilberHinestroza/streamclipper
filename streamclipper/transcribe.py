@@ -13,9 +13,10 @@ funcione aunque no esté instalado.
 from __future__ import annotations
 
 import re
-import unicodedata
 import warnings
 from dataclasses import dataclass
+
+from .content import normalize_text as _normalize
 
 # Palabras/frases en español e inglés que suelen indicar un momento de hype
 # en streams de videojuegos. Ajustable por el usuario (ver `--hype-keywords`
@@ -106,38 +107,88 @@ def transcribe(video_path: str, model_size: str = "base", language: str | None =
     ]
 
 
-def _normalize(text: str) -> str:
-    """minúsculas + sin tildes, para no perder matches por acentos
-    (ej. 'murió' vs 'murio')."""
-    text = text.lower()
-    return "".join(c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn")
+@dataclass
+class KeywordHit:
+    """Una keyword de hype encontrada en la transcripción.
+
+    `time` es un estimado del momento EXACTO en que se dijo la palabra dentro
+    del segmento, no el inicio del segmento entero. Whisper agrupa varias
+    frases en un solo segmento (de 2 a 10 segundos es común): usar
+    `seg.start` como timestamp centraba el boost y la ventana del clip varios
+    segundos antes de la palabra real, y en un segmento largo la palabra
+    podía quedar hasta el final — que es justo donde peor queda el recorte.
+
+    La estimación reparte el segmento proporcionalmente a la posición
+    (caracteres) de la palabra dentro del texto: no es tan exacto como pedirle
+    a whisper los tiempos por palabra (`word_timestamps`), pero no cuesta
+    transcribir nada más y es suficiente para anclar la ventana del clip.
+    """
+
+    time: float
+    keyword: str
+    text: str
 
 
-def find_keyword_timestamps(
+def _keyword_patterns(keywords: list[str]) -> list[tuple[str, re.Pattern[str]]]:
+    pairs: list[tuple[str, re.Pattern[str]]] = []
+    for kw in keywords:
+        if not kw.strip():
+            continue
+        pairs.append(
+            (
+                kw,
+                re.compile(r"(?<!\w)" + re.escape(_normalize(kw)) + r"(?!\w)"),
+            )
+        )
+    return pairs
+
+
+def find_keyword_hits(
     segments: list[TranscriptSegment],
     keywords: list[str] | None = None,
-) -> list[float]:
-    """Devuelve los timestamps (inicio del segmento) donde aparece alguna
-    keyword de hype, sin distinguir mayúsculas/minúsculas ni acentos.
+) -> list[KeywordHit]:
+    """Devuelve un hit por cada ocurrencia de una keyword de hype, con el
+    timestamp estimado de la palabra dentro del segmento.
 
     IMPORTANTE: usa límites de palabra (no un simple "substring in text"),
     porque una keyword corta como "ace" hacía falso-match dentro de palabras
     comunes en español como "hace" — eso fue un bug real que inflaba mucho
     la cantidad de "hits de hype" en streams hablados en español, contando
     como hype momentos que solo eran conversación normal.
+
+    Antes devolvía solo `seg.start` (un hit por segmento, siempre al inicio);
+    ahora hay un hit por ocurrencia, con su propio tiempo estimado.
     """
     keywords = keywords or DEFAULT_HYPE_KEYWORDS
-    patterns = [
-        re.compile(r"(?<!\w)" + re.escape(_normalize(kw)) + r"(?!\w)")
-        for kw in keywords
-        if kw.strip()
-    ]
-    hits = []
+    pairs = _keyword_patterns(keywords)
+    hits: list[KeywordHit] = []
     for seg in segments:
         text_norm = _normalize(seg.text)
-        if any(p.search(text_norm) for p in patterns):
-            hits.append(seg.start)
+        if not text_norm:
+            continue
+        span = float(seg.end) - float(seg.start)
+        if span <= 0:
+            continue
+        for keyword, pattern in pairs:
+            for match in pattern.finditer(text_norm):
+                fraction = match.start() / len(text_norm)
+                hits.append(
+                    KeywordHit(
+                        time=float(seg.start) + span * fraction,
+                        keyword=keyword,
+                        text=seg.text,
+                    )
+                )
+    hits.sort(key=lambda h: h.time)
     return hits
+
+
+def find_keyword_timestamps(
+    segments: list[TranscriptSegment],
+    keywords: list[str] | None = None,
+) -> list[float]:
+    """Compat: devuelve solo los timestamps de `find_keyword_hits`."""
+    return [h.time for h in find_keyword_hits(segments, keywords)]
 
 
 def segments_to_srt(segments: list[TranscriptSegment], offset: float = 0.0) -> str:

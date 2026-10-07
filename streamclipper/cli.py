@@ -25,14 +25,35 @@ from .clipper import (
     subtitle_margin_v,
     write_temp_srt,
 )
-from .scoring import apply_keyword_boost, compute_hype_score, find_candidates, merge_overlapping
+from .content import classify_segments, detect_stream_kind
+from .scoring import (
+    apply_chat_penalty,
+    apply_keyword_boost,
+    candidates_from_anchors,
+    compute_hype_score,
+    find_candidates,
+    grow_candidates,
+    merge_overlapping,
+    select_best,
+)
 from .transcribe import (
-    find_keyword_timestamps,
+    find_keyword_hits,
     segments_to_srt,
     transcribe,
 )
 from .facecam import detect_camera_region
 from .visual import find_text_hits
+
+# Duración máxima (s) que puede alcanzar un clip después de fusionar ventanas
+# solapadas. Evita que varias keywords seguidas (algo normal en un stream muy
+# hablado) encadenen ventanas y terminen formando UN clip de media hora.
+MAX_CLIP_SPAN = 75.0
+
+# Solape mínimo (s) para fusionar dos ventanas en un clip. Por debajo de esto
+# son momentos distintos: mejor dos clips (con un segundo o dos repetidos) que
+# uno largo con los dos adentro. Espejo del overlap_tolerance de
+# select_best.
+MERGE_MIN_OVERLAP = 5.0
 
 
 def get_duration(video_path: str) -> float:
@@ -137,6 +158,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-gap", type=float, default=25.0, help="Segundos mínimos entre dos clips")
     p.add_argument("--pre-roll", type=float, default=8.0, help="Segundos antes del pico a incluir")
     p.add_argument("--post-roll", type=float, default=18.0, help="Segundos después del pico a incluir")
+    p.add_argument(
+        "--keyword-pre-roll", type=float, default=15.0,
+        help="Segundos ANTES de una palabra clave de la transcripción (ej. 'ace', 'win', 'derrota') a incluir "
+             "(default 15). Se usa un valor distinto del pre-roll normal a propósito: la palabra se dice "
+             "DESPUÉS de la jugada, así que lo que hay que mostrar está antes. Requiere --transcribe",
+    )
+    p.add_argument(
+        "--keyword-post-roll", type=float, default=10.0,
+        help="Segundos DESPUÉS de una palabra clave a incluir (default 10). Requiere --transcribe",
+    )
+    p.add_argument(
+        "--stream-kind", choices=["auto", "gameplay", "justchatting"], default="auto",
+        help="Si el VOD es de juego o de la categoría Just Chatting. 'auto' (default) lo infiere de la "
+             "transcripción: en Just Chatting los gritos de charla con el chat SÍ son clippeables, en "
+             "gameplay se penalizan (ver --chat-penalty)",
+    )
+    p.add_argument(
+        "--chat-penalty", type=float, default=0.6,
+        help="Cuánto restarle al score de un clip donde el grito es claramente peleando/charlando con el "
+             "chat y no hay nada de juego en el transcript (default 0.6, que suele dejarlo por debajo de "
+             "--min-score). 0 desactiva el filtro. Necesita --transcribe; no aplica en --stream-kind "
+             "justchatting",
+    )
     p.add_argument("--vertical", action="store_true", help="Exportar en formato vertical 9:16")
     p.add_argument(
         "--vertical-fit", choices=["blur", "crop"], default="blur",
@@ -269,7 +313,7 @@ def _run(args: argparse.Namespace, out_dir: str) -> int:
     profile = compute_energy_profile(audio)
 
     transcript_segments = []
-    keyword_hits: list[float] = []
+    keyword_hits = []
     if args.transcribe:
         print(f"[3/6] Transcribiendo con whisper ({args.whisper_model}) — esto puede tardar ...")
         try:
@@ -279,8 +323,8 @@ def _run(args: argparse.Namespace, out_dir: str) -> int:
             for w in caught:
                 print(f"      Aviso: {w.message}")
             custom_hype_keywords = [k.strip() for k in args.hype_keywords.split(",") if k.strip()] or None
-            keyword_hits = find_keyword_timestamps(transcript_segments, keywords=custom_hype_keywords)
-            print(f"      {len(transcript_segments)} segmentos, {len(keyword_hits)} con keywords de hype")
+            keyword_hits = find_keyword_hits(transcript_segments, keywords=custom_hype_keywords)
+            print(f"      {len(transcript_segments)} segmentos, {len(keyword_hits)} keywords de hype detectadas")
             if args.captions and not transcript_segments:
                 print(
                     "      Aviso: whisper no encontró texto en el audio (0 segmentos), "
@@ -301,6 +345,24 @@ def _run(args: argparse.Namespace, out_dir: str) -> int:
             print(f"      Aviso: la transcripción falló y se va a continuar sin ella ({exc})")
     else:
         print("[3/6] Transcripción desactivada (usa --transcribe para activarla)")
+
+    # Clasificación del transcript: ¿el streamer habla del juego o charla con
+    # el chat? De acá salen dos cosas: qué ventanas de tiempo cuentan como
+    # evidencia de juego/charla (para penalizar gritos que son peleas con el
+    # chat) y el tipo de stream detectado (en Just Chatting esa penalización
+    # se apaga, porque ahí la charla con el chat ES el contenido).
+    segment_labels = classify_segments(transcript_segments) if transcript_segments else []
+    stream_kind = args.stream_kind
+    if stream_kind == "auto":
+        stream_kind = detect_stream_kind(segment_labels) if segment_labels else "gameplay"
+    if transcript_segments:
+        origin = " (detectado de la transcripción)" if args.stream_kind == "auto" else " (forzado)"
+        print(f"      Tipo de stream: {stream_kind}{origin}")
+    if args.chat_penalty > 0 and not segment_labels:
+        print(
+            "      Aviso: el filtro de gritos que son peleando con el chat necesita "
+            "--transcribe; en esta corrida no se aplica."
+        )
 
     visual_hit_times: list[float] = []
     if args.visual_detect:
@@ -347,7 +409,9 @@ def _run(args: argparse.Namespace, out_dir: str) -> int:
     hype_score = compute_hype_score(profile)
     scores = hype_score
     if keyword_hits:
-        scores = apply_keyword_boost(profile.times, scores, keyword_hits, boost=0.4, spread_seconds=3.0)
+        scores = apply_keyword_boost(
+            profile.times, scores, [h.time for h in keyword_hits], boost=0.4, spread_seconds=3.0
+        )
     if visual_hit_times:
         # Un boost más fuerte que el de keywords de voz: un texto confirmado
         # en pantalla (ej. "You Died") es una señal más directa que una
@@ -355,7 +419,7 @@ def _run(args: argparse.Namespace, out_dir: str) -> int:
         scores = apply_keyword_boost(profile.times, scores, visual_hit_times, boost=0.6, spread_seconds=4.0)
 
     print("[5/6] Buscando picos de hype y armando clips candidatos ...")
-    candidates = find_candidates(
+    peak_candidates = find_candidates(
         profile,
         scores=scores,
         min_score=args.min_score,
@@ -365,7 +429,60 @@ def _run(args: argparse.Namespace, out_dir: str) -> int:
         video_duration=duration,
         max_candidates=args.num_clips * 3,
     )
-    candidates = merge_overlapping(candidates)[: args.num_clips]
+
+    # Candidatos anclados a keywords de la transcripción y a texto en
+    # pantalla. Sin esto el recorte dependía de que el pico de energía
+    # cayera cerca de la palabra, y lo habitual es lo contrario: "ace",
+    # "win" o "derrota" se dicen DESPUÉS de la jugada, así que la ventana
+    # `pico - pre_roll .. pico + post_roll` dejaba la jugada previa cortada.
+    # Acá la ventana se arma alrededor de la palabra (con más contexto antes
+    # que después) y después se estira mientras siga la acción.
+    anchors: list[tuple[float, str]] = [
+        (h.time, f"keyword '{h.keyword}'") for h in keyword_hits
+    ] + [(t, "texto en pantalla") for t in visual_hit_times]
+    anchor_candidates = candidates_from_anchors(
+        profile,
+        scores,
+        anchors,
+        min_score=args.min_score,
+        pre_roll=args.keyword_pre_roll,
+        post_roll=args.keyword_post_roll,
+        video_duration=duration,
+    )
+    print(
+        f"      {len(peak_candidates)} pico(s) de energía + "
+        f"{len(anchor_candidates)} anclado(s) a keywords/texto en pantalla"
+    )
+
+    candidates = merge_overlapping(
+        peak_candidates + anchor_candidates,
+        max_span=MAX_CLIP_SPAN,
+        min_overlap=MERGE_MIN_OVERLAP,
+    )
+    grow_candidates(candidates, profile.times, scores, video_duration=duration)
+    candidates = merge_overlapping(
+        candidates, max_span=MAX_CLIP_SPAN, min_overlap=MERGE_MIN_OVERLAP
+    )
+
+    penalized = apply_chat_penalty(
+        candidates,
+        segment_labels,
+        visual_hit_times,
+        stream_kind,
+        penalty=args.chat_penalty,
+    )
+    if penalized:
+        print(
+            f"      {penalized} candidato(s) con el score restado por {args.chat_penalty:g} "
+            "por ser charla/pelea con el chat y no de juego"
+        )
+
+    candidates = select_best(
+        candidates,
+        max_clips=args.num_clips,
+        min_score=args.min_score,
+        min_gap=args.min_gap,
+    )
 
     if not candidates:
         emit_progress(stage="done", total=0)
@@ -435,7 +552,17 @@ def _run(args: argparse.Namespace, out_dir: str) -> int:
                 clip_segments = [
                     s for s in transcript_segments if s.end >= cand.start and s.start <= cand.end
                 ]
-                srt_text = segments_to_srt(clip_segments, offset=cand.start)
+                # offset=0 (timestamps ABSOLUTOS del VOD), no cand.start.
+                #
+                # El `-ss` va como opción de salida, así que ffmpeg decodifica
+                # desde el inicio del video y descarta frames: el filtro
+                # `subtitles` ve la línea de tiempo completa del VOD, no la del
+                # clip. Con timestamps relativos (offset=cand.start) los cues
+                # se dibujaban en frames que después se descartaban y el
+                # subtítulo NO aparecía en ningún clip salvo el que empieza en
+                # 0 — sin dar ningún error, y el manifest decía igual
+                # captions_burned: true.
+                srt_text = segments_to_srt(clip_segments, offset=0.0)
                 if srt_text.strip():
                     srt_path = write_temp_srt(srt_text)
                 else:
@@ -469,7 +596,9 @@ def _run(args: argparse.Namespace, out_dir: str) -> int:
 
         title_note = f' — "{title}"' if title else ""
         visual_note = " [detección visual]" if visual_hit_here else ""
-        print(f"      -> {out_path}  [{cand.start:.1f}s - {cand.end:.1f}s, score={cand.score:.2f}]{title_note}{captions_note}{visual_note}")
+        reasons = list(dict.fromkeys(cand.reasons))  # sin repetidos
+        reasons_note = f" ({', '.join(reasons)})" if reasons else ""
+        print(f"      -> {out_path}  [{cand.start:.1f}s - {cand.end:.1f}s, score={cand.score:.2f}]{reasons_note}{title_note}{captions_note}{visual_note}")
         emit_progress(stage="export_progress", current=i, total=total)
 
         manifest.append({
@@ -479,6 +608,7 @@ def _run(args: argparse.Namespace, out_dir: str) -> int:
             "end": round(cand.end, 2),
             "peak_time": round(cand.peak_time, 2),
             "score": round(cand.score, 3),
+            "reasons": reasons,
             "suggested_title": title,
             "captions_burned": srt_path is not None,
             "visual_hit": visual_hit_here,

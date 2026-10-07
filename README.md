@@ -22,13 +22,18 @@ de depender de reglas específicas de un juego.
    no generar clips pegados.
 4. (Opcional) Transcribe el audio con `faster-whisper` para reforzar el
    score cuando se detectan frases típicas de hype ("no way", "vamos",
-   "gg", "insano", etc.) y para generar subtítulos quemados en el clip.
-5. Corta cada momento en un clip de video independiente con `ffmpeg`,
+   "gg", "insano", etc.), **anclar el recorte del clip a esos momentos**
+   (ver la sección de keywords abajo) y generar subtítulos quemados en el
+   clip.
+5. (Opcional) Clasifica lo transcrito en "juego" vs "charla con el chat" para
+   separar gritos por una jugada de gritos porque el streamer está peleando
+   con el chat (ver sección de abajo).
+6. Corta cada momento en un clip de video independiente con `ffmpeg`,
    opcionalmente en formato vertical 9:16 (TikTok/Reels/Shorts) y con
    subtítulos.
-6. Genera un `manifest.json` con el detalle de cada clip (inicio, fin,
-   score) para que puedas revisar o automatizar el resto del flujo
-   (publicar, renombrar, etc.).
+7. Genera un `manifest.json` con el detalle de cada clip (inicio, fin,
+   score, y el motivo por el que fue elegido) para que puedas revisar o
+   automatizar el resto del flujo (publicar, renombrar, etc.).
 
 ## Instalación
 
@@ -98,7 +103,10 @@ Esto genera hasta 8 clips en la carpeta `clips/`, ordenados por score
 | `--min-score X` | Umbral de sensibilidad [0-1]. Más bajo = más clips, algunos menos intensos (default 0.5) |
 | `--fast` | Corte rápido sin recodificar. Más veloz pero el clip puede arrancar en el keyframe más cercano (a veces se ve entrecortado al inicio). Por defecto siempre recodifica para evitar ese problema |
 | `--min-gap S` | Segundos mínimos entre dos clips distintos (default 25) |
-| `--pre-roll S` / `--post-roll S` | Cuánto contexto incluir antes/después del pico (default 8s / 18s) |
+| `--pre-roll S` / `--post-roll S` | Cuánto contexto incluir antes/después del pico de energía (default 8s / 18s) |
+| `--keyword-pre-roll S` / `--keyword-post-roll S` | Lo mismo, pero para los clips anclados a una palabra clave de la transcripción (default 15s antes / 10s después). El default es asimétrico a propósito: "ace", "win" o "derrota" se dicen DESPUÉS de la jugada, así que lo que hay que mostrar está antes de la palabra. Requiere `--transcribe` |
+| `--stream-kind auto\|gameplay\|justchatting` | Si el VOD es de juego o de la categoría Just Chatting. `auto` (default) lo infiere de la transcripción. En Just Chatting los gritos de charla con el chat SÍ son clippeables |
+| `--chat-penalty X` | Cuánto restarle al score de un clip donde el grito es peleando/charlando con el chat y no hay nada de juego en el transcript (default 0.6, que suele dejarlo por debajo de `--min-score`). `0` desactiva el filtro. Necesita `--transcribe` y no aplica en `justchatting` |
 | `--vertical` | Exporta en 1080x1920 para TikTok/Shorts/Reels |
 | `--vertical-fit blur\|crop` | Cómo se adapta el video 16:9 al lienzo 9:16. `blur` (default) = el gameplay entra **completo**, con una copia de fondo ampliada y desenfocada llenando el resto (sin barras negras, sin perder juego). `crop` = el recorte centrado de siempre |
 | `--transcribe` | Activa transcripción con whisper (más lento, necesita `faster-whisper`) |
@@ -158,6 +166,14 @@ python -m streamclipper.cli test_video.mp4 --out-dir clips_test --min-score 0.3
 ```
 
 Debería detectar 4 "momentos hype" cerca de los segundos 15, 45, 90 y 140.
+
+Hay además dos suites de tests que no necesitan ffmpeg ni un VOD real (la
+segunda sí exporta clips del video sintético, así que tarda un poco más):
+
+```bash
+python tests/test_units.py        # recorte por keywords, crecimiento de ventanas, filtro de chat
+python tests/test_cli_stubbed.py  # el CLI completo con transcripción simulada
+```
 
 ## Detección visual (OCR) — experimental
 
@@ -258,6 +274,76 @@ muletillas normales de conversación y no solo en momentos de hype. Si te
 sirven para tu forma de hablar, puedes agregarlas de vuelta con
 `--hype-keywords` (ver tabla de opciones arriba) — ese campo también está
 disponible en la interfaz gráfica, en la sección de transcripción.
+
+## Recortes alrededor de keywords y gritos que no son del juego
+
+Dos problemas reportados con el generador de clips, y cómo se resolvieron:
+
+### 1. Los clips con "ace", "win", "derrota" no mostraban la jugada
+
+El recorte viejo dependía SOLO de los picos de energía: `pico - pre_roll ..
+pico + post_roll` (8s antes / 18s después). El problema es que una palabra
+así se dice **después** de la jugada (el streamer reacciona al resultado), y
+encima `find_peaks` se queda con un único máximo local por zona — si el grito
+caía a varios segundos de la palabra, la ventana quedaba anclada al grito y
+la jugada previa quedaba cortada o directamente afuera. Resultado típico:
+"se ven unos pocos segundos antes y el resto después, sin la jugada".
+
+Ahora hay tres cambios que trabajan juntos:
+
+1. **El timestamp de la keyword es el de la palabra**, no el inicio del
+   segmento de whisper (que puede ser de varios segundos y poner el ancla
+   mucho antes de donde se dijo realmente).
+2. **Se arma un candidato DIRECTAMENTE anclado a la keyword** (y a cada texto
+   en pantalla detectado por OCR), con ventana asimétrica: 15s antes / 10s
+   después por defecto (`--keyword-pre-roll` / `--keyword-post-roll`). Su
+   score es el máximo de la curva (con el boost ya aplicado) dentro de esa
+   ventana, así que una keyword dicha en calma no genera clip por sí sola.
+3. **La ventana crece mientras dure la acción** (`grow_candidates`): desde el
+   recorte base, cada borde se extiende mientras el score se mantenga alto
+   (con tope de 20s más hacia atrás, 12s hacia adelante y 60s de duración
+   total). Así una ronda que empieza 25s antes de que digas "derrota" queda
+   entera, y el clip se corta en cuanto vuelve la calma — en vez de depender
+   de un número fijo de segundos.
+
+Además, dos ventanas que se solapan poco ya no se fusionan en un clip eterno
+(hay un `max_span` de 75s y un solape mínimo de 5s para fusionar): dos
+momentos distintos a pocos segundos dan dos clips, no uno largo con los dos
+adentro. Cada clip del `manifest.json` ahora trae un campo `reasons` con el
+motivo por el que fue elegido ("pico de energía", "keyword 'ace'", "texto en
+pantalla", etc.), y esos motivos también se imprimen en el log.
+
+### 2. Gritos que en realidad son peleas con el chat
+
+La energía de audio no distingue un grito por una jugada de un grito porque
+el streamer está discutiendo con el chat: son el mismo volumen. La
+transcripción sí lo distingue, así que ahora cada candidato se contrasta con
+lo que se dijo en su ventana:
+
+- Si hay **evidencia de juego** (vocabulario de juego en el transcript, o
+  texto en pantalla detectado por OCR) → se conserva.
+- Si hay **charla con el chat alrededor del pico y CERO evidencia de
+  juego** → se le resta `--chat-penalty` (0.6 por defecto) al score, lo que
+  normalmente lo manda por debajo de `--min-score` y queda afuera. Ese
+  "alegando con el chat" no sobrevive; un "CHAT NOOO" gritado durante una
+  jugada, en cambio, suele venir con vocabulario de juego en la ventana y se
+  queda.
+- Si no hay transcripción en el rango, **no se penaliza** (ante la duda, no
+  se descarta un clip bueno).
+
+Y la excepción que pediste: **en streams Just Chatting no se penaliza nada**,
+porque ahí la charla con el chat ES el contenido. Como un archivo local no
+trae la categoría del stream, `--stream-kind auto` (el default) la infiere del
+vocabulario de toda la transcripción — solo se declara "justchatting" si el
+vocabulario de juego aparece en menos del 5% de los segmentos con evidencia y
+el del chat en al menos el 25%; con dudas se asume gameplay. Si se equivoca
+en tu VOD, se fuerza con `--stream-kind justchatting` (en la GUI: el
+desplegable "Tipo de stream", junto a la casilla "Evitar clips donde el grito
+es peleando/charlando con el chat").
+
+Ojo: este filtro (como la detección de keywords y los subtítulos) necesita
+`--transcribe` activado. Sin transcripción no hay forma de saber de qué se
+habla en el clip, y el programa lo avisa en el log.
 
 ## Vertical 9:16 sin perder gameplay (`--vertical-fit blur`)
 

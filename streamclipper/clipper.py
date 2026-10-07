@@ -34,13 +34,23 @@ def _subtitle_filter(srt_path: str, margin: int | None = None) -> str:
     vertical con fondo desenfocado caigan SOBRE el gameplay y no sobre el
     fondo borroso. El valor lo calcula `subtitle_margin_v` según el aspecto
     real del video de origen.
+
+    OJO con los timestamps del .srt: como el `-ss` va como opción de SALIDA
+    (después de `-i`), ffmpeg NO hace seek en el grafo de filtros — decodifica
+    desde el inicio del video y descarta frames hasta el punto pedido. El filtro
+    `subtitles` ve entonces la línea de tiempo COMPLETA del video (0, 0.5, 1.0,
+    ... hasta el final), no la del clip. Por eso el .srt tiene que llevar
+    timestamps ABSOLUTOS (809.5, 810.0, ...); con timestamps relativos al clip
+    (0..26s) los cues se dibujan en frames que después se descartan y el
+    subtítulo no aparece nunca. Salvo en el clip que empieza en 0, donde por
+    casualidad coincidían. Lo arma el CLI con `segments_to_srt(..., offset=0)`.
     """
-    if not margin:
-        return f"subtitles='{escape_filter_path(srt_path)}'"
-    return (
-        f"subtitles='{escape_filter_path(srt_path)}'"
-        f":force_style='Alignment=2,MarginV={int(margin)}'"
-    )
+    if margin:
+        return (
+            f"subtitles='{escape_filter_path(srt_path)}'"
+            f":force_style='Alignment=2,MarginV={int(margin)}'"
+        )
+    return f"subtitles='{escape_filter_path(srt_path)}'"
 
 
 def _fit_over_blur_chain(
